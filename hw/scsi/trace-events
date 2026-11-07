@@ -215,6 +215,7 @@ esp_pci_sbac_read(uint32_t reg) "sbac: 0x%8.8x"
 esp_pci_sbac_write(uint32_t reg, uint32_t val) "sbac: 0x%8.8x -> 0x%8.8x"
 
 # spapr_vscsi.c
+spapr_vscsi_direct_data(uint32_t tag, uint32_t offset, uint64_t addr, uint32_t len, uint32_t head) "tag=%u offset=0x%x addr=0x%"PRIx64" len=0x%x head=0x%08x"
 spapr_vscsi_send_rsp(uint8_t status, int32_t res_in, int32_t res_out) "status: 0x%x, res_in: %"PRId32", res_out: %"PRId32
 spapr_vscsi_fetch_desc_no_data(void) "no data descriptor"
 spapr_vscsi_fetch_desc_direct(void) "direct segment"
@@ -345,6 +346,7 @@ virtio_scsi_an_resp(int lun, int response) "virtio_scsi_an_resp lun=%u response=
 virtio_scsi_event(int lun, int event, int reason) "virtio_scsi_event lun=%u event=%d reason=%d"
 
 # scsi-disk.c
+scsi_disk_rw_error(uint32_t tag, uint64_t sector, int ret, bool is_read) "tag=%u sector=%"PRIu64" ret=%d read=%d"
 scsi_disk_check_condition(uint32_t tag, uint8_t key, uint8_t asc, uint8_t ascq) "Command complete tag=0x%x sense=%d/%d/%d"
 scsi_disk_read_complete(uint32_t tag, size_t size) "Data ready tag=0x%x len=%zd"
 scsi_disk_read_data_count(uint32_t sector_count) "Read sector_count=%d"

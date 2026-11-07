@@ -68,6 +68,9 @@ static void spapr_reset_vcpu(PowerPCCPU *cpu)
 
     ppc_store_lpcr(cpu, lpcr);
 
+    /* AIX real-mode code relies on the 1TiB VRMA segment wrap */
+    cpu->vhyp_vrma_wrap = spapr->aix_compat;
+
     /* Set a full AMOR so guest can use the AMR as it sees fit */
     env->spr[SPR_AMOR] = 0xffffffffffffffffull;
 

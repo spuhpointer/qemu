@@ -1,0 +1,573 @@
+diff --git a/hw/ppc/spapr.c b/hw/ppc/spapr.c
+index b79828b..77cf40b 100644
+--- a/hw/ppc/spapr.c
++++ b/hw/ppc/spapr.c
+@@ -790,6 +790,14 @@ static void spapr_dt_cpu(CPUState *cs, void *fdt, int offset,
+ 
+     spapr_dt_pa_features(spapr, cpu, fdt, offset);
+ 
++    if (spapr->aix_papr && ppc_has_spr(cpu, SPR_DSCR)) {
++        /* Make the emulated DSCR controls discoverable to the AIX kernel. */
++        static const uint8_t pa_optimizations[] = { 2, 0, 0x10, 0 };
++
++        _FDT(fdt_setprop(fdt, offset, "ibm,pa-optimizations",
++                         pa_optimizations, sizeof(pa_optimizations)));
++    }
++
+     spapr_dt_pi_features(spapr, cpu, fdt, offset);
+ 
+     _FDT((fdt_setprop_cell(fdt, offset, "ibm,chip-id",
+@@ -1068,6 +1076,10 @@ static void spapr_dt_rtas(SpaprMachineState *spapr, void *fdt)
+                           RTAS_ERROR_LOG_MAX));
+     _FDT(fdt_setprop_cell(fdt, rtas, "rtas-event-scan-rate",
+                           RTAS_EVENT_SCAN_RATE));
++    if (spapr->aix_papr) {
++        _FDT(fdt_setprop_cell(fdt, rtas,
++                             "ibm,partition-performance-parameters-level", 1));
++    }
+ 
+     g_assert(msi_nonbroken);
+     _FDT(fdt_setprop(fdt, rtas, "ibm,change-msix-capable", NULL, 0));
+@@ -1271,7 +1283,18 @@ void *spapr_build_fdt(SpaprMachineState *spapr, bool reset, size_t space)
+     /* Root node */
+     _FDT(fdt_setprop_string(fdt, 0, "device_type", "chrp"));
+     _FDT(fdt_setprop_string(fdt, 0, "model", "IBM pSeries (emulated by qemu)"));
+-    _FDT(fdt_setprop_string(fdt, 0, "compatible", "qemu,pseries"));
++    /*
++     * AIX 7.3 boot loaders refuse "qemu,pseries" and enable their QEMU
++     * support only for "qemu,pseriesNOPE".
++     */
++    _FDT(fdt_setprop_string(fdt, 0, "compatible",
++                            spapr->aix_papr ? "IBM,pSeries" :
++                            spapr->aix_compat ? "qemu,pseriesNOPE"
++                                              : "qemu,pseries"));
++
++    if (spapr->aix_papr) {
++        _FDT(fdt_setprop_cell(fdt, 0, "ibm,partition-no", 0));
++    }
+ 
+     /* Guest UUID & Name*/
+     buf = qemu_uuid_unparse_strdup(&qemu_uuid);
+@@ -1300,6 +1323,15 @@ void *spapr_build_fdt(SpaprMachineState *spapr, bool reset, size_t space)
+ 
+     /* /interrupt controller */
+     spapr_irq_dt(spapr, spapr_max_server_number(spapr), fdt, PHANDLE_INTC);
++    if (spapr->aix_papr) {
++        int intc = fdt_path_offset(fdt, "/interrupt-controller");
++        uint64_t reg[2] = { 0, 0 };
++
++        /* XICS uses hypercalls, but AIX also requires the reg property. */
++        if (intc >= 0) {
++            _FDT(fdt_setprop(fdt, intc, "reg", reg, sizeof(reg)));
++        }
++    }
+ 
+     ret = spapr_dt_memory(spapr, fdt);
+     if (ret < 0) {
+@@ -3351,6 +3383,30 @@ static void spapr_set_resize_hpt(Object *obj, const char *value, Error **errp)
+     }
+ }
+ 
++static bool spapr_get_aix_compat(Object *obj, Error **errp)
++{
++    SpaprMachineState *spapr = SPAPR_MACHINE(obj);
++
++    return spapr->aix_compat;
++}
++
++static bool spapr_get_aix_papr(Object *obj, Error **errp)
++{
++    return SPAPR_MACHINE(obj)->aix_papr;
++}
++
++static void spapr_set_aix_papr(Object *obj, bool value, Error **errp)
++{
++    SPAPR_MACHINE(obj)->aix_papr = value;
++}
++
++static void spapr_set_aix_compat(Object *obj, bool value, Error **errp)
++{
++    SpaprMachineState *spapr = SPAPR_MACHINE(obj);
++
++    spapr->aix_compat = value;
++}
++
+ static bool spapr_get_vof(Object *obj, Error **errp)
+ {
+     SpaprMachineState *spapr = SPAPR_MACHINE(obj);
+@@ -3496,6 +3552,16 @@ static void spapr_instance_init(Object *obj)
+     object_property_set_description(obj, "x-vof",
+                                     "Enable Virtual Open Firmware (experimental)");
+ 
++    object_property_add_bool(obj, "aix-compat", spapr_get_aix_compat,
++                             spapr_set_aix_compat);
++    object_property_set_description(obj, "aix-compat",
++                                    "Advertise the root compatible value that "
++                                    "AIX 7.3 accepts");
++    object_property_add_bool(obj, "aix-papr", spapr_get_aix_papr,
++                             spapr_set_aix_papr);
++    object_property_set_description(obj, "aix-papr",
++                                    "Experimental native PAPR identity for AIX");
++
+     /* The machine class defines the default interrupt controller mode */
+     spapr->irq = smc->irq;
+     object_property_add_str(obj, "ic-mode", spapr_get_ic_mode,
+diff --git a/hw/ppc/spapr_cpu_core.c b/hw/ppc/spapr_cpu_core.c
+index 9a93519..7741931 100644
+--- a/hw/ppc/spapr_cpu_core.c
++++ b/hw/ppc/spapr_cpu_core.c
+@@ -68,6 +68,9 @@ static void spapr_reset_vcpu(PowerPCCPU *cpu)
+ 
+     ppc_store_lpcr(cpu, lpcr);
+ 
++    /* AIX real-mode code relies on the 1TiB VRMA segment wrap */
++    cpu->vhyp_vrma_wrap = spapr->aix_compat;
++
+     /* Set a full AMOR so guest can use the AMR as it sees fit */
+     env->spr[SPR_AMOR] = 0xffffffffffffffffull;
+ 
+diff --git a/hw/ppc/spapr_hcall.c b/hw/ppc/spapr_hcall.c
+index 23bcd78..1149cf2 100644
+--- a/hw/ppc/spapr_hcall.c
++++ b/hw/ppc/spapr_hcall.c
+@@ -1565,8 +1565,9 @@ void spapr_unregister_hypercall(target_ulong opcode)
+     *slot = NULL;
+ }
+ 
+-target_ulong spapr_hypercall(PowerPCCPU *cpu, target_ulong opcode,
+-                             target_ulong *args)
++static target_ulong spapr_hypercall_dispatch(PowerPCCPU *cpu,
++                                             target_ulong opcode,
++                                             target_ulong *args)
+ {
+     SpaprMachineState *spapr = SPAPR_MACHINE(qdev_get_machine());
+ 
+@@ -1598,6 +1599,16 @@ target_ulong spapr_hypercall(PowerPCCPU *cpu, target_ulong opcode,
+     return H_FUNCTION;
+ }
+ 
++target_ulong spapr_hypercall(PowerPCCPU *cpu, target_ulong opcode,
++                             target_ulong *args)
++{
++    uint64_t a0 = args[0], a1 = args[1], a2 = args[2], a3 = args[3];
++    target_ulong ret = spapr_hypercall_dispatch(cpu, opcode, args);
++
++    trace_spapr_hcall(opcode, a0, a1, a2, a3, ret, args[0], args[1]);
++    return ret;
++}
++
+ #ifdef CONFIG_TCG
+ static void hypercall_register_softmmu(void)
+ {
+@@ -1623,6 +1634,26 @@ static void hypercall_register_softmmu(void)
+ }
+ #endif
+ 
++static target_ulong h_get_ppp(PowerPCCPU *cpu, SpaprMachineState *spapr,
++                             target_ulong opcode, target_ulong *args)
++{
++    MachineState *ms = MACHINE(spapr);
++    uint64_t cores = DIV_ROUND_UP(ms->smp.cpus, ms->smp.threads);
++    uint64_t capacity = cores * 100;
++
++    if (!spapr->aix_papr) {
++        return H_FUNCTION;
++    }
++
++    /* A single capped partition owns the emulated processor pool. */
++    args[0] = capacity;
++    args[1] = 0;
++    args[2] = cores << 32;
++    args[3] = (1ULL << 48) | (128ULL << 40) | (cores << 16) | cores;
++    args[4] = (cores << 48) | (capacity << 24) | capacity;
++    return H_SUCCESS;
++}
++
+ static void hypercall_register_types(void)
+ {
+     hypercall_register_softmmu();
+@@ -1636,6 +1667,7 @@ static void hypercall_register_types(void)
+     spapr_register_hypercall(H_CEDE, h_cede);
+     spapr_register_hypercall(H_CONFER, h_confer);
+     spapr_register_hypercall(H_PROD, h_prod);
++    spapr_register_hypercall(H_GET_PPP, h_get_ppp);
+ 
+     /* hcall-join */
+     spapr_register_hypercall(H_JOIN, h_join);
+diff --git a/hw/ppc/spapr_numa.c b/hw/ppc/spapr_numa.c
+index ea6762d..324dad3 100644
+--- a/hw/ppc/spapr_numa.c
++++ b/hw/ppc/spapr_numa.c
+@@ -481,8 +481,19 @@ static void spapr_numa_FORM1_write_rtas_dt(SpaprMachineState *spapr,
+     _FDT(fdt_setprop(fdt, rtas, "ibm,associativity-reference-points",
+                      refpoints, nr_refpoints * sizeof(refpoints[0])));
+ 
+-    _FDT(fdt_setprop(fdt, rtas, "ibm,max-associativity-domains",
+-                     maxdomains, sizeof(maxdomains)));
++    if (spapr->aix_papr && ms->numa_state->num_nodes > 1) {
++        uint32_t aix_maxdomains[6];
++
++        /* AIX validates the CPU leaf level as well as the NUMA domains. */
++        memcpy(aix_maxdomains, maxdomains, sizeof(maxdomains));
++        aix_maxdomains[0] = cpu_to_be32(5);
++        aix_maxdomains[5] = cpu_to_be32(spapr_max_server_number(spapr));
++        _FDT(fdt_setprop(fdt, rtas, "ibm,max-associativity-domains",
++                         aix_maxdomains, sizeof(aix_maxdomains)));
++    } else {
++        _FDT(fdt_setprop(fdt, rtas, "ibm,max-associativity-domains",
++                         maxdomains, sizeof(maxdomains)));
++    }
+ }
+ 
+ static void spapr_numa_FORM2_write_rtas_tables(SpaprMachineState *spapr,
+diff --git a/hw/ppc/spapr_rtas.c b/hw/ppc/spapr_rtas.c
+index 328fc27..4394920 100644
+--- a/hw/ppc/spapr_rtas.c
++++ b/hw/ppc/spapr_rtas.c
+@@ -303,7 +303,8 @@ static void rtas_ibm_get_system_parameter(PowerPCCPU *cpu,
+                                                      "DesMem=%" PRIu64 ","
+                                                      "DesProcs=%d,"
+                                                      "MaxPlatProcs=%d",
+-                                                     ms->smp.max_cpus,
++                                                     ms->smp.max_cpus *
++                                                     (spapr->aix_compat ? 100 : 1),
+                                                      ms->ram_size / MiB,
+                                                      ms->smp.cpus,
+                                                      ms->smp.max_cpus);
+diff --git a/hw/ppc/trace-events b/hw/ppc/trace-events
+index 1f125ce..867478b 100644
+--- a/hw/ppc/trace-events
++++ b/hw/ppc/trace-events
+@@ -10,6 +10,7 @@ spapr_pci_lsi_set(const char *busname, int pin, uint32_t irq) "%s PIN%d IRQ %u"
+ spapr_pci_msi_retry(unsigned config_addr, unsigned req_num, unsigned max_irqs) "Guest device at 0x%x asked %u, have only %u"
+ 
+ # spapr_hcall.c
++spapr_hcall(uint64_t opcode, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t ret, uint64_t r4, uint64_t r5) "op=0x%"PRIx64" args=0x%"PRIx64" 0x%"PRIx64" 0x%"PRIx64" 0x%"PRIx64" ret=%"PRId64" out=0x%"PRIx64" 0x%"PRIx64
+ spapr_cas_continue(unsigned long n) "Copy changes to the guest: %ld bytes"
+ spapr_cas_pvr(uint32_t cur_pvr, bool explicit_match, uint32_t new_pvr) "current=0x%x, explicit_match=%u, new=0x%x"
+ spapr_h_resize_hpt_prepare(uint64_t flags, uint64_t shift) "flags=0x%"PRIx64", shift=%"PRIu64
+diff --git a/hw/scsi/scsi-disk.c b/hw/scsi/scsi-disk.c
+index a42f7d8..54e7167 100644
+--- a/hw/scsi/scsi-disk.c
++++ b/hw/scsi/scsi-disk.c
+@@ -111,6 +111,7 @@ struct SCSIDiskState {
+     char *vendor;
+     char *product;
+     char *device_id;
++    char *aix_vscsi_id;
+     char *loadparm;     /* only for s390x */
+     bool tray_open;
+     bool tray_locked;
+@@ -232,6 +233,8 @@ static bool scsi_handle_rw_error(SCSIDiskReq *r, int ret, bool acct_failed)
+     BlockErrorAction action;
+     int status;
+ 
++    trace_scsi_disk_rw_error(r->req.tag, r->sector, ret, is_read);
++
+     /*
+      * host_status should only be set for SG_IO requests that came back with a
+      * host_status error in scsi_block_sgio_complete(). This error path passes
+@@ -711,7 +714,19 @@ static int scsi_disk_emulate_vpd_page(SCSIRequest *req, uint8_t *outbuf)
+ 
+         trace_scsi_disk_emulate_vpd_page_83(req->cmd.xfer);
+ 
+-        if (id_len) {
++        if (s->aix_vscsi_id) {
++            /* AIX's QEMU mode also requires a recognized VPD identifier. */
++            int aix_id_len = strlen(s->aix_vscsi_id);
++
++            outbuf[buflen++] = 0x2; /* ASCII */
++            outbuf[buflen++] = 0x1; /* T10 vendor identification, logical unit */
++            outbuf[buflen++] = 0;
++            outbuf[buflen++] = 8 + aix_id_len;
++            strpadcpy((char *)&outbuf[buflen], 8, s->vendor, ' ');
++            buflen += 8;
++            memcpy(&outbuf[buflen], s->aix_vscsi_id, aix_id_len);
++            buflen += aix_id_len;
++        } else if (id_len) {
+             outbuf[buflen++] = 0x2; /* ASCII */
+             outbuf[buflen++] = 0;   /* not officially assigned */
+             outbuf[buflen++] = 0;   /* reserved */
+@@ -860,6 +875,19 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
+ 
+     /* Sync data transfer and TCQ.  */
+     outbuf[7] = 0x10 | (req->bus->info->tcq ? 0x02 : 0);
++
++    if (s->aix_vscsi_id) {
++        /*
++         * AIX's disk/vscsi/vdisk configuration method reads its unique_id
++         * from the vendor-specific bytes 96..254 of standard INQUIRY.
++         * Without it, installation succeeds but existing MPIO paths are
++         * left missing after restbase, preventing the next disk boot.
++         * Advertise the complete response even for a short allocation.
++         */
++        strpadcpy((char *)&outbuf[96], 159, s->aix_vscsi_id, ' ');
++        outbuf[4] = 255 - 5;
++        buflen = MIN(req->cmd.xfer, 255);
++    }
+     return buflen;
+ }
+ 
+@@ -2609,6 +2637,22 @@ static void scsi_hd_realize(SCSIDevice *dev, Error **errp)
+ {
+     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, dev);
+ 
++    if (s->aix_vscsi_id) {
++        size_t len = strlen(s->aix_vscsi_id);
++
++        if (!len || len > 159) {
++            error_setg(errp, "x-aix-vscsi-id must contain 1 to 159 characters");
++            return;
++        }
++        for (size_t i = 0; i < len; i++) {
++            if (!g_ascii_isgraph(s->aix_vscsi_id[i])) {
++                error_setg(errp, "x-aix-vscsi-id must contain printable "
++                           "ASCII characters without spaces");
++                return;
++            }
++        }
++    }
++
+     /* can happen for devices without drive. The error message for missing
+      * backend will be issued in scsi_realize
+      */
+@@ -3234,6 +3278,7 @@ static const TypeInfo scsi_disk_base_info = {
+ 
+ static const Property scsi_hd_properties[] = {
+     DEFINE_SCSI_DISK_PROPERTIES(),
++    DEFINE_PROP_STRING("x-aix-vscsi-id", SCSIDiskState, aix_vscsi_id),
+     DEFINE_PROP_BIT("removable", SCSIDiskState, features,
+                     SCSI_DISK_F_REMOVABLE, false),
+     DEFINE_PROP_BIT("dpofua", SCSIDiskState, features,
+diff --git a/hw/scsi/spapr_vscsi.c b/hw/scsi/spapr_vscsi.c
+index b4c8f94..9b0bef3 100644
+--- a/hw/scsi/spapr_vscsi.c
++++ b/hw/scsi/spapr_vscsi.c
+@@ -86,7 +86,8 @@ typedef struct vscsi_req {
+     uint16_t                total_desc;
+     uint16_t                cdb_offset;
+     uint16_t                cur_desc_num;
+-    uint16_t                cur_desc_offset;
++    /* A direct descriptor can span multiple 128 KiB SCSI DMA chunks. */
++    uint32_t                cur_desc_offset;
+ } vscsi_req;
+ 
+ #define TYPE_VIO_SPAPR_VSCSI_DEVICE "spapr-vscsi"
+@@ -387,6 +388,9 @@ static int vscsi_srp_direct_data(VSCSIState *s, vscsi_req *req,
+     if (rc) {
+         return -1;
+     }
++    trace_spapr_vscsi_direct_data(req->qtag, req->cur_desc_offset,
++                                  md.va, llen,
++                                  llen >= 4 ? ldl_be_p(buf) : 0);
+     req->cur_desc_offset += llen;
+ 
+     return llen;
+@@ -620,7 +624,7 @@ static const VMStateDescription vmstate_spapr_vscsi_req = {
+         VMSTATE_UINT16(cdb_offset, vscsi_req),
+       /*Restart SCSI request from the beginning for now */
+       /*VMSTATE_UINT16(cur_desc_num, vscsi_req),
+-        VMSTATE_UINT16(cur_desc_offset, vscsi_req),*/
++        VMSTATE_UINT32(cur_desc_offset, vscsi_req),*/
+         VMSTATE_END_OF_LIST()
+     },
+ };
+@@ -764,9 +768,11 @@ static void vscsi_report_luns(VSCSIState *s, vscsi_req *req)
+         DeviceState *qdev = kid->child;
+         SCSIDevice *dev = SCSI_DEVICE(qdev);
+ 
+-        if (dev->id == 0 && dev->channel == 0) {
++        if (dev->id == 0 && dev->channel == 0 &&
++            !SPAPR_MACHINE(qdev_get_machine())->aix_papr) {
+             resp_data[i] = 0;         /* Use simple LUN for 0 (SAM5 4.7.7.1) */
+         } else {
++            /* AIX's native vSCSI discovery treats an all-zero LUN as empty. */
+             resp_data[i] = (2 << 6);  /* Otherwise LUN addressing (4.7.7.4)  */
+         }
+         resp_data[i] |= dev->id;
+diff --git a/hw/scsi/trace-events b/hw/scsi/trace-events
+index a8ac1e7..5a12506 100644
+--- a/hw/scsi/trace-events
++++ b/hw/scsi/trace-events
+@@ -215,6 +215,7 @@ esp_pci_sbac_read(uint32_t reg) "sbac: 0x%8.8x"
+ esp_pci_sbac_write(uint32_t reg, uint32_t val) "sbac: 0x%8.8x -> 0x%8.8x"
+ 
+ # spapr_vscsi.c
++spapr_vscsi_direct_data(uint32_t tag, uint32_t offset, uint64_t addr, uint32_t len, uint32_t head) "tag=%u offset=0x%x addr=0x%"PRIx64" len=0x%x head=0x%08x"
+ spapr_vscsi_send_rsp(uint8_t status, int32_t res_in, int32_t res_out) "status: 0x%x, res_in: %"PRId32", res_out: %"PRId32
+ spapr_vscsi_fetch_desc_no_data(void) "no data descriptor"
+ spapr_vscsi_fetch_desc_direct(void) "direct segment"
+@@ -345,6 +346,7 @@ virtio_scsi_an_resp(int lun, int response) "virtio_scsi_an_resp lun=%u response=
+ virtio_scsi_event(int lun, int event, int reason) "virtio_scsi_event lun=%u event=%d reason=%d"
+ 
+ # scsi-disk.c
++scsi_disk_rw_error(uint32_t tag, uint64_t sector, int ret, bool is_read) "tag=%u sector=%"PRIu64" ret=%d read=%d"
+ scsi_disk_check_condition(uint32_t tag, uint8_t key, uint8_t asc, uint8_t ascq) "Command complete tag=0x%x sense=%d/%d/%d"
+ scsi_disk_read_complete(uint32_t tag, size_t size) "Data ready tag=0x%x len=%zd"
+ scsi_disk_read_data_count(uint32_t sector_count) "Read sector_count=%d"
+diff --git a/include/hw/ppc/spapr.h b/include/hw/ppc/spapr.h
+index 9acda15..86de20d 100644
+--- a/include/hw/ppc/spapr.h
++++ b/include/hw/ppc/spapr.h
+@@ -249,6 +249,8 @@ struct SpaprMachineState {
+     char *kvm_type;
+     char *host_model;
+     char *host_serial;
++    bool aix_compat;
++    bool aix_papr;
+ 
+     int32_t irq_map_nr;
+     unsigned long *irq_map;
+diff --git a/target/ppc/cpu.h b/target/ppc/cpu.h
+index cbd5964..1090241 100644
+--- a/target/ppc/cpu.h
++++ b/target/ppc/cpu.h
+@@ -1526,6 +1526,8 @@ struct ArchCPU {
+     uint32_t compat_pvr;
+     PPCVirtualHypervisor *vhyp;
+     PPCVirtualHypervisorClass *vhyp_class;
++    /* Under vhyp, real mode wraps at 1TiB like a PowerVM VRMA segment */
++    bool vhyp_vrma_wrap;
+     void *machine_data;
+     int32_t node_id; /* NUMA node this CPU belongs to */
+     PPCHash64Options *hash64_opts;
+diff --git a/target/ppc/mmu-hash64.c b/target/ppc/mmu-hash64.c
+index 2c33d98..c48d6d6 100644
+--- a/target/ppc/mmu-hash64.c
++++ b/target/ppc/mmu-hash64.c
+@@ -1014,9 +1014,13 @@ bool ppc_hash64_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
+ 
+         if (cpu->vhyp) {
+             /*
+-             * In virtual hypervisor mode, there's nothing to do:
+-             *   EA == GPA == qemu guest address
++             * In virtual hypervisor mode, EA == GPA == qemu guest address.
++             * A PowerVM VRMA translates real mode through one 1TiB segment,
++             * so only the segment offset selects the address.
+              */
++            if (cpu->vhyp_vrma_wrap) {
++                raddr &= (1ULL << 40) - 1;
++            }
+         } else if (mmuidx_hv(mmu_idx) || !env->has_hv_mode) {
+             /* In HV mode, add HRMOR if top EA bit is clear */
+             if (!(eaddr >> 63)) {
+diff --git a/tests/qtest/virtio-scsi-test.c b/tests/qtest/virtio-scsi-test.c
+index e2350c5..665a46a 100644
+--- a/tests/qtest/virtio-scsi-test.c
++++ b/tests/qtest/virtio-scsi-test.c
+@@ -61,7 +61,7 @@ static uint64_t qvirtio_scsi_alloc(QVirtioSCSIQueues *vs, size_t alloc_size,
+ 
+ static uint8_t virtio_scsi_do_command(QVirtioSCSIQueues *vs,
+                                       const uint8_t *cdb,
+-                                      const uint8_t *data_in,
++                                      uint8_t *data_in,
+                                       size_t data_in_len,
+                                       uint8_t *data_out, size_t data_out_len,
+                                       struct virtio_scsi_cmd_resp *resp_out)
+@@ -110,6 +110,9 @@ static uint8_t virtio_scsi_do_command(QVirtioSCSIQueues *vs,
+     if (resp_out) {
+         memread(resp_addr, resp_out, sizeof(*resp_out));
+     }
++    if (data_in && data_in_len) {
++        memread(data_in_addr, data_in, data_in_len);
++    }
+ 
+     guest_free(alloc, req_addr);
+     guest_free(alloc, resp_addr);
+@@ -164,6 +167,59 @@ static void hotplug(void *obj, void *data, QGuestAllocator *t_alloc)
+     qtest_qmp_device_del(qts, "scsihd");
+ }
+ 
++static void test_aix_vscsi_inquiry(void *obj, void *data,
++                                  QGuestAllocator *t_alloc)
++{
++    QVirtioSCSI *scsi = obj;
++    QVirtioSCSIQueues *vs;
++    const char *id = data;
++    uint8_t cdb[VIRTIO_SCSI_CDB_SIZE] = { INQUIRY };
++    uint8_t buf[255];
++    struct virtio_scsi_cmd_resp resp;
++    const unsigned lengths[] = { 4, 36, 96, 255 };
++
++    alloc = t_alloc;
++    vs = qvirtio_scsi_init(scsi->vdev);
++    for (size_t i = 0; i < G_N_ELEMENTS(lengths); i++) {
++        memset(buf, 0xa5, sizeof(buf));
++        cdb[4] = lengths[i];
++        g_assert_cmpint(virtio_scsi_do_command(vs, cdb, buf, lengths[i],
++                                             NULL, 0, &resp), ==, 0);
++        g_assert_cmpint(resp.status, ==, GOOD);
++        if (id && lengths[i] >= 5) {
++            g_assert_cmpint(buf[4], ==, 250);
++        }
++        if (lengths[i] == sizeof(buf)) {
++            if (id) {
++                g_assert_cmpmem(buf + 96, strlen(id), id, strlen(id));
++                for (size_t j = 96 + strlen(id); j < sizeof(buf); j++) {
++                    g_assert_cmpint(buf[j], ==, ' ');
++                }
++            } else {
++                g_assert_cmpint(buf[96], ==, 0);
++            }
++        }
++    }
++
++    cdb[1] = 1;
++    cdb[2] = 0x83;
++    cdb[4] = sizeof(buf);
++    g_assert_cmpint(virtio_scsi_do_command(vs, cdb, buf, sizeof(buf),
++                                         NULL, 0, &resp), ==, 0);
++    g_assert_cmpint(resp.status, ==, GOOD);
++    g_assert_cmpint(buf[1], ==, 0x83);
++    g_assert_cmpint(buf[4], ==, 2); /* ASCII */
++    g_assert_cmpint(buf[5], ==, id ? 1 : 0);
++    if (id) {
++        g_assert_cmpint(buf[3], ==, 12 + strlen(id));
++        g_assert_cmpint(buf[7], ==, 8 + strlen(id));
++        g_assert_cmpmem(buf + 8, 8, "QEMU    ", 8);
++        g_assert_cmpmem(buf + 16, strlen(id), id, strlen(id));
++    }
++    qvirtio_scsi_pci_free(vs);
++    g_free(data);
++}
++
+ /* Test WRITE SAME with the lba not aligned */
+ static void test_unaligned_write_same(void *obj, void *data,
+                                       QGuestAllocator *t_alloc)
+@@ -365,6 +421,18 @@ static void *virtio_scsi_setup_4k(GString *cmd_line, void *arg)
+     return arg;
+ }
+ 
++static void *virtio_scsi_setup_aix(GString *cmd_line, void *arg)
++{
++    unsigned len = GPOINTER_TO_UINT(arg);
++    char *id = len ? g_strnfill(len, 'A') : NULL;
++
++    virtio_scsi_setup(cmd_line, NULL);
++    if (id) {
++        g_string_append_printf(cmd_line, ",x-aix-vscsi-id=%s", id);
++    }
++    return id;
++}
++
+ static void *virtio_scsi_setup_cd(GString *cmd_line, void *arg)
+ {
+     g_string_append(cmd_line,
+@@ -395,6 +463,17 @@ static void register_virtio_scsi_test(void)
+     qos_add_test("unaligned-write-same", "virtio-scsi",
+                  test_unaligned_write_same, &opts);
+ 
++    opts.before = virtio_scsi_setup_aix;
++    qos_add_test("inquiry-default", "virtio-scsi",
++                 test_aix_vscsi_inquiry, &opts);
++    opts.arg = GUINT_TO_POINTER(17);
++    qos_add_test("inquiry-aix-vscsi", "virtio-scsi",
++                 test_aix_vscsi_inquiry, &opts);
++    opts.arg = GUINT_TO_POINTER(159);
++    qos_add_test("inquiry-aix-vscsi-max", "virtio-scsi",
++                 test_aix_vscsi_inquiry, &opts);
++    opts.arg = NULL;
++
+     opts.before = virtio_scsi_setup_4k;
+     qos_add_test("large-lba-unmap", "virtio-scsi",
+                  test_unmap_large_lba, &opts);

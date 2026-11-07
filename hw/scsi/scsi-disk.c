@@ -111,6 +111,7 @@ struct SCSIDiskState {
     char *vendor;
     char *product;
     char *device_id;
+    char *aix_vscsi_id;
     char *loadparm;     /* only for s390x */
     bool tray_open;
     bool tray_locked;
@@ -231,6 +232,8 @@ static bool scsi_handle_rw_error(SCSIDiskReq *r, int ret, bool acct_failed)
     bool req_has_sense = false;
     BlockErrorAction action;
     int status;
+
+    trace_scsi_disk_rw_error(r->req.tag, r->sector, ret, is_read);
 
     /*
      * host_status should only be set for SG_IO requests that came back with a
@@ -711,7 +714,19 @@ static int scsi_disk_emulate_vpd_page(SCSIRequest *req, uint8_t *outbuf)
 
         trace_scsi_disk_emulate_vpd_page_83(req->cmd.xfer);
 
-        if (id_len) {
+        if (s->aix_vscsi_id) {
+            /* AIX's QEMU mode also requires a recognized VPD identifier. */
+            int aix_id_len = strlen(s->aix_vscsi_id);
+
+            outbuf[buflen++] = 0x2; /* ASCII */
+            outbuf[buflen++] = 0x1; /* T10 vendor identification, logical unit */
+            outbuf[buflen++] = 0;
+            outbuf[buflen++] = 8 + aix_id_len;
+            strpadcpy((char *)&outbuf[buflen], 8, s->vendor, ' ');
+            buflen += 8;
+            memcpy(&outbuf[buflen], s->aix_vscsi_id, aix_id_len);
+            buflen += aix_id_len;
+        } else if (id_len) {
             outbuf[buflen++] = 0x2; /* ASCII */
             outbuf[buflen++] = 0;   /* not officially assigned */
             outbuf[buflen++] = 0;   /* reserved */
@@ -860,6 +875,19 @@ static int scsi_disk_emulate_inquiry(SCSIRequest *req, uint8_t *outbuf)
 
     /* Sync data transfer and TCQ.  */
     outbuf[7] = 0x10 | (req->bus->info->tcq ? 0x02 : 0);
+
+    if (s->aix_vscsi_id) {
+        /*
+         * AIX's disk/vscsi/vdisk configuration method reads its unique_id
+         * from the vendor-specific bytes 96..254 of standard INQUIRY.
+         * Without it, installation succeeds but existing MPIO paths are
+         * left missing after restbase, preventing the next disk boot.
+         * Advertise the complete response even for a short allocation.
+         */
+        strpadcpy((char *)&outbuf[96], 159, s->aix_vscsi_id, ' ');
+        outbuf[4] = 255 - 5;
+        buflen = MIN(req->cmd.xfer, 255);
+    }
     return buflen;
 }
 
@@ -2609,6 +2637,22 @@ static void scsi_hd_realize(SCSIDevice *dev, Error **errp)
 {
     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, dev);
 
+    if (s->aix_vscsi_id) {
+        size_t len = strlen(s->aix_vscsi_id);
+
+        if (!len || len > 159) {
+            error_setg(errp, "x-aix-vscsi-id must contain 1 to 159 characters");
+            return;
+        }
+        for (size_t i = 0; i < len; i++) {
+            if (!g_ascii_isgraph(s->aix_vscsi_id[i])) {
+                error_setg(errp, "x-aix-vscsi-id must contain printable "
+                           "ASCII characters without spaces");
+                return;
+            }
+        }
+    }
+
     /* can happen for devices without drive. The error message for missing
      * backend will be issued in scsi_realize
      */
@@ -3234,6 +3278,7 @@ static const TypeInfo scsi_disk_base_info = {
 
 static const Property scsi_hd_properties[] = {
     DEFINE_SCSI_DISK_PROPERTIES(),
+    DEFINE_PROP_STRING("x-aix-vscsi-id", SCSIDiskState, aix_vscsi_id),
     DEFINE_PROP_BIT("removable", SCSIDiskState, features,
                     SCSI_DISK_F_REMOVABLE, false),
     DEFINE_PROP_BIT("dpofua", SCSIDiskState, features,

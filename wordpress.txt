@@ -1,0 +1,344 @@
+<!-- Publication draft: verify the public repository URL/branch before posting. -->
+
+<!-- wp:html -->
+
+<article>
+
+<h1>Running AIX 7.3 on patched QEMU</h1>
+
+<p>This branch makes an independently licensed AIX 7.3 installation usable on QEMU&#x27;s emulated POWER platform. The reference system ran AIX 7.3 TL3 SP1 (<code>7300-03-01-2520</code>) on an Apple M2 Pro using TCG, with four POWER9 vCPUs, 4 GiB RAM, XICS interrupts, two virtual NUMA nodes, and a 40 GiB qcow2 disk. It booted from disk, accepted console and SSH logins, passed disk-integrity and network tests, and ran Active System Optimizer (ASO).</p>
+
+<p>This is a source contribution: QEMU fixes, source patches, helpers and build instructions. No compiled QEMU executable, generated firmware, AIX media, installed disk, credentials or guest dump is distributed by this contribution. Obtain and use your own appropriately licensed AIX and Toolbox media. The firmware involved here is open-source SLOF, not proprietary IBM firmware.</p>
+
+<p>The profile is experimental and tested in the configuration above. It is not a complete PowerVM implementation or a claim of IBM support. POWER on Apple Silicon or an x86 Linux host uses software emulation; HVF and x86 KVM cannot hardware-accelerate this cross-architecture guest. ASO can monitor and manage guest workloads, but it cannot turn TCG into real POWER hardware.</p>
+
+<h2>1. Get the correct source branch</h2>
+
+<p>The baseline is QEMU <code>v11.1.3</code> at commit <code>005c61c0ef6f6ae615283440b4bb7be51b2c6ddd</code>. The example URL assumes these changes have been published as branch <code>aix73-papr</code>; substitute the owner or branch if publishing elsewhere. Check out the branch containing the fixes, not an older unrelated branch in the fork.</p>
+
+<pre><code>git clone --branch aix73-papr https://github.com/spuhpointer/qemu.git qemu-aix73
+cd qemu-aix73
+cat VERSION
+git status --short</code></pre>
+
+<p>The QEMU source files in this branch already contain the fixes. <code>contrib/aix73/aix73-qemu.patch</code> is a text export for a clean upstream v11.1.3 checkout; do not apply it again to this branch. Helpers live in <code>contrib/aix73/</code>. <code>AGENTS.md</code> records maintenance and privacy rules.</p>
+
+<h2>2. Build on macOS</h2>
+
+<p>Install Apple&#x27;s command-line developer tools and the Homebrew dependencies. The debugger tools are optional for ordinary use.</p>
+
+<pre><code>xcode-select --install
+brew install glib pixman libslirp ninja gnutls zstd pkgconf python
+brew install socat gdb dtc radare2
+JOBS=10 ./contrib/aix73/build-qemu.sh</code></pre>
+
+<p>The helper prefers an installed modern Python interpreter; <code>PYTHON</code> can select one explicitly. This avoids accidentally using an incomplete system Python environment. It configures only <code>ppc64-softmmu</code>, installs the optimized build into <code>dist/</code>, and generates local SLOF firmware under <code>build-aix-firmware/</code>. The generated directories are ignored by Git.</p>
+
+<p>The equivalent manual configure/build sequence is:</p>
+
+<pre><code>mkdir -p build
+cd build
+../configure --prefix=&quot;$PWD/../dist&quot; --target-list=ppc64-softmmu \
+  --enable-slirp --enable-vmnet --enable-cocoa --enable-gnutls \
+  --enable-zstd --enable-tools --disable-docs
+make -j10 install
+cd ..
+python3 contrib/aix73/make-slof-aix.py
+ls -l build/qemu-system-ppc64 dist/bin/qemu-system-ppc64</code></pre>
+
+<p>If configure selects an unsuitable Python, pass <code>--python=/path/to/python3</code>. The launcher uses the installed <code>dist/</code> executable, so rebuilding without installing does not update the VM executable.</p>
+
+<h2>3. Build on Linux</h2>
+
+<p>For Debian/Ubuntu hosts, install the development dependencies and use the same helper. On another distribution, use its equivalent package names. This recipe is provided for rebuilding the source on Linux; the AIX end-to-end reference validation was performed on the macOS host.</p>
+
+<pre><code>sudo apt-get update
+sudo apt-get install build-essential git python3 python3-venv python3-pip \
+  python3-tomli pkg-config ninja-build libglib2.0-dev libpixman-1-dev \
+  libslirp-dev libgnutls28-dev libzstd-dev socat device-tree-compiler
+JOBS=8 ./contrib/aix73/build-qemu.sh</code></pre>
+
+<p>The helper omits <code>--enable-vmnet</code> and <code>--enable-cocoa</code> on Linux. User-mode NAT remains the simplest network setup. An x86 Linux server still uses TCG for the POWER guest; tap/bridge integration is a separate host setup.</p>
+
+<p>For a debug build, use the following. Debug TCG is much slower; use the optimized build for installation and ordinary operation.</p>
+
+<pre><code>JOBS=8 ./contrib/aix73/build-qemu.sh debug
+# Select it when launching a VM:
+QEMU_BUILD=debug CONSOLE=sock DAEMONIZE=1 ./contrib/aix73/run-aix.sh</code></pre>
+
+<p><code>BUILD_DIR</code> and <code>DIST_DIR</code> relocate build outputs. The launcher accepts <code>DIST_DIR</code> or <code>QEMU_BIN</code> when using a non-default installation prefix. Set <code>DISK</code> as described below before launching either build.</p>
+
+<h2>4. Generate or rebuild SLOF locally</h2>
+
+<p>The bundled SLOF PREP boot loader limits reads to 32 MiB, while the tested AIX bosboot image is larger. The build helper runs <code>make-slof-aix.py</code> to raise this limit to 256 MiB in a locally generated image. It changes one fixed-length embedded Forth expression and refuses an unexpected input. It uses QEMU&#x27;s existing public SLOF asset; no modified binary is added to Git.</p>
+
+<pre><code>python3 contrib/aix73/make-slof-aix.py
+# The launcher defaults to:
+# build-aix-firmware/slof-aix.bin</code></pre>
+
+<p>A source-build alternative is also supplied. On a Linux host with a big-endian PowerPC64 cross compiler, build the pinned open-source SLOF submodule after applying the text patch:</p>
+
+<pre><code>sudo apt-get install gcc-powerpc64-linux-gnu binutils-powerpc64-linux-gnu
+git submodule update --init roms/SLOF
+git -C roms/SLOF apply ../../contrib/aix73/slof-prep-limit.patch
+make -C roms/SLOF CROSS=powerpc64-linux-gnu- -j4 qemu
+mkdir -p build-aix-firmware
+cp roms/SLOF/boot_rom.bin build-aix-firmware/slof-aix.bin</code></pre>
+
+<p>Apply the SLOF source patch once to its clean pinned checkout. The reproducible bundled-image transformation was used in the reference setup; the cross-build commands follow SLOF&#x27;s own build procedure. <code>FIRMWARE</code> can select another locally built image. Do not stage any generated firmware.</p>
+
+<h2>5. Choose private storage and licensed media</h2>
+
+<p>Keep disks and media outside the source checkout. Choose a volume with enough space for the 40 GiB virtual disk to grow, plus any local snapshots and backups. A small system volume is a poor place for VM storage. Edit the media path below to point to your own AIX installation image.</p>
+
+<pre><code>export VM_DIR=&quot;$HOME/VirtualMachines/aix73&quot;
+# An external disk or another filesystem can be used instead.
+mkdir -p &quot;$VM_DIR&quot;
+export DISK=&quot;$VM_DIR/aix.qcow2&quot;
+export RUN_DIR=&quot;$PWD/run-aix73&quot;
+mkdir -p &quot;$RUN_DIR&quot;
+chmod 700 &quot;$RUN_DIR&quot;
+export INSTALL_ISO=&quot;/absolute/path/to/your/AIX_7.3_install.iso&quot;</code></pre>
+
+<p>The launcher requires an absolute <code>DISK</code> path and never embeds a workstation-specific default. Install mode creates a missing qcow2 image; boot mode refuses a missing disk. It also refuses to start over a live PID in the selected state directory. Do not have the ISO mounted by the host while QEMU opens it: host mounting can conflict with QEMU&#x27;s read lock.</p>
+
+<h2>6. Install AIX through the serial console</h2>
+
+<p>To reproduce the validated sequence, bootstrap the installation in AIX&#x27;s built-in QEMU mode, then switch to native PAPR after the first login. The final default profile is native PAPR; the explicit options below select the bootstrap mode. Only attach the new VM disk you intend to install onto.</p>
+
+<pre><code>AIX_PAPR=off NUMA_SPLIT=0 SMP=4 DAEMONIZE=1 CONSOLE=sock \
+  ./contrib/aix73/run-aix.sh install &quot;$INSTALL_ISO&quot;
+socat -,raw,echo=0,escape=0x1d &quot;unix-connect:$RUN_DIR/console.sock&quot;</code></pre>
+
+<ul><li>At &#x27;Please define the System Console&#x27;, enter the selection shown on that console.</li><li>Choose the installation language and review the installation settings. Menu numbers can differ between media levels.</li><li>For a new blank VM, choose the intended installation method, confirm the virtual disk and size, and complete BOS installation. An overwrite installation destroys the contents of the selected guest disk.</li><li>Allow kernel loading, device configuration and package installation to finish. TCG installation and first-boot file checks can take considerable time.</li><li>Ctrl-] disconnects socat without shutting down the VM. The serial socket accepts one client at a time.</li><li>Once installation has completed, launch from the installed disk. Install mode deliberately boots CD media, so an automatic reboot of that same QEMU process can return to the installer.</li></ul>
+
+<p>If the installer has finished and returned to firmware or the installer, stop that completed install session with the monitor, then start disk mode. Do not use monitor quit during installation or normal writable guest work.</p>
+
+<pre><code>python3 contrib/aix73/vmctl.py qmp quit
+AIX_PAPR=off NUMA_SPLIT=0 SMP=4 DAEMONIZE=1 CONSOLE=sock \
+  ./contrib/aix73/run-aix.sh
+socat -,raw,echo=0,escape=0x1d &quot;unix-connect:$RUN_DIR/console.sock&quot;</code></pre>
+
+<p>Finish AIX&#x27;s first-boot assistant. <code>vt100</code> is a useful terminal choice. Review and accept the applicable terms, complete the assistant, and log in as root. Set your own root password; do not copy someone else&#x27;s credentials or save them in the public checkout. Leave the original AIX kernel, application binaries, boot scripts and fsck tools in place.</p>
+
+<p>The bootstrap mode can report that ASO is unsupported on KVM. That is why the final native-PAPR profile is provided. No AIX binary patch or forced boot-device edit is needed with the QEMU fixes in this branch.</p>
+
+<h2>7. Configure the guest network</h2>
+
+<p>The default user-mode network requires no host root privileges. It provides NAT and forwards localhost port 2222 to guest SSH port 22. Inside AIX, as root, configure the virtual Ethernet interface and DNS:</p>
+
+<pre><code>mktcpip -h aix73 -a 10.0.2.15 -m 255.255.255.0 -i en0 -g 10.0.2.2
+namerslv -a -i 10.0.2.3
+ifconfig en0
+ping -c 3 10.0.2.2
+host www.ibm.com</code></pre>
+
+<p>The DNS step is separate because <code>mktcpip -n</code> requires a domain argument. These addresses are QEMU&#x27;s private NAT defaults, not a physical LAN setup. You can set your own hostname and timezone; for example, <code>chtz UTC0</code> sets UTC for new sessions.</p>
+
+<p><code>NET=shared</code> and <code>NET=bridged</code> use macOS vmnet and require elevated host privileges; their sockets can become root-owned. <code>BRIDGE_IF</code> selects the bridge interface. The simple SSH helper is intended for the default localhost NAT forwarding. Optional localhost port 2323 is reserved for telnet forwarding, but no telnet setup is required; use SSH.</p>
+
+<h2>8. Set up your own SSH key</h2>
+
+<p>On the host, generate a new key in the ignored private state directory. Choose your own passphrase. Only the public key is copied into AIX.</p>
+
+<pre><code>ssh-keygen -t ed25519 -f &quot;$RUN_DIR/aix_ed25519&quot; -C aix73-local
+cat &quot;$RUN_DIR/aix_ed25519.pub&quot;</code></pre>
+
+<p>At the AIX root console, create the authorized-keys file and paste your own public key in place of the placeholder:</p>
+
+<pre><code>umask 077
+mkdir -p &quot;$HOME/.ssh&quot;
+cat &gt;&gt; &quot;$HOME/.ssh/authorized_keys&quot; &lt;&lt;&#x27;PUBLIC_KEY&#x27;
+PASTE_YOUR_OWN_PUBLIC_KEY_HERE
+PUBLIC_KEY
+chmod 700 &quot;$HOME/.ssh&quot;
+chmod 600 &quot;$HOME/.ssh/authorized_keys&quot;
+lssrc -s sshd
+# If sshd is not active, start it:
+startsrc -s sshd</code></pre>
+
+<p>If this installation did not include OpenSSH, install its AIX fileset from your appropriate licensed media before this step. Review SSH&#x27;s host-key fingerprint on first connection. The helper uses a private known-hosts file instead of changing your normal host SSH configuration.</p>
+
+<pre><code># Back on the host:
+./contrib/aix73/ssh-aix.sh
+# Explicit equivalent:
+ssh -i &quot;$RUN_DIR/aix_ed25519&quot; -o IdentitiesOnly=yes \
+  -o UserKnownHostsFile=&quot;$RUN_DIR/ssh_known_hosts&quot; -p 2222 root@127.0.0.1</code></pre>
+
+<p><code>SSH_USER</code>, <code>SSH_KEY</code> and <code>SSH_PORT</code> customize the helper. No key, password or populated known-hosts file is included in the project.</p>
+
+<p>For interactive file transfers, run <code>./contrib/aix73/sftp-aix.sh</code> on the host. It uses the same <code>RUN_DIR</code>, <code>SSH_KEY</code>, <code>SSH_USER</code> and <code>SSH_PORT</code> settings. SFTP uses uppercase <code>-P</code> for its port. Within SFTP, <code>put</code> uploads, <code>get</code> downloads and <code>bye</code> disconnects.</p>
+
+<h2>9. Enable the final native-PAPR profile and ASO</h2>
+
+<p>Shut down the bootstrap guest cleanly, then start the default profile on the host. This selects POWER9/XICS, four vCPUs across two sockets, two memory nodes, the stable SCSI identity and the native-PAPR compatibility additions.</p>
+
+<pre><code># Inside AIX:
+shutdown -Fh
+# Wait for &#x27;Halt completed&#x27; and for QEMU to exit.
+
+# On the host, with DISK and RUN_DIR still exported:
+DAEMONIZE=1 CONSOLE=sock ./contrib/aix73/run-aix.sh
+./contrib/aix73/ssh-aix.sh</code></pre>
+
+<p>Changing from the bootstrap QEMU mode can change AIX&#x27;s device identity and cause the boot disk to appear as <code>hdisk1</code> instead of <code>hdisk0</code>. Use <code>bootinfo -b</code> and <code>lspath</code> to inspect the actual device. Do not hardcode a disk name into AIX&#x27;s boot script.</p>
+
+<pre><code># Inside the native-PAPR guest:
+oslevel -s
+bootinfo -b
+lspath
+lssrad -av
+lparstat -i
+lssrc -s aso
+asoo -a
+tail -20 /var/log/aso/aso.log</code></pre>
+
+<p>If ASO was previously disabled, re-enable its normal service configuration inside this native-PAPR guest, and start it if not already active:</p>
+
+<pre><code>chitab &#x27;aso:23456789:once:/usr/bin/startsrc -s aso&#x27;
+startsrc -s aso
+asoo -p -o aso_active=1</code></pre>
+
+<p>The reference topology showed two SRADs with CPUs 0-1 and 2-3. ASO remained active and registered/monitored workloads. Its large-page-promotion message about insufficient memory is expected at 4 GiB. Eligibility and workload activity still govern individual optimizations; an active daemon does not guarantee a performance gain under TCG.</p>
+
+<h2>10. Attach and mount the AIX Toolbox ISO</h2>
+
+<p>Use the Toolbox binary image for your AIX release. The source-code image is useful for source packages, but does not replace the binary installation media. The launcher always creates a CD drive because the virtual SCSI bus cannot hot-add a new drive. With that drive present, media can be changed while the VM is running.</p>
+
+<pre><code># On the host:
+export TOOLBOX_ISO=&quot;/absolute/path/to/your/Toolbox_binary.iso&quot;
+python3 contrib/aix73/vmctl.py hmp &quot;change cd0 \&quot;$TOOLBOX_ISO\&quot; raw&quot;
+printf &#x27;%s\n&#x27; &quot;$TOOLBOX_ISO&quot; &gt; &quot;$RUN_DIR/cdrom.path&quot;</code></pre>
+
+<p>If another disc is mounted in AIX, unmount it before changing the media. The remembered path is private local configuration, not a tracked file. <code>CDROM=/absolute/path/to/image.iso</code> overrides it at cold start; <code>CDROM=&#x27;&#x27;</code> selects an empty drive.</p>
+
+<pre><code># Inside AIX:
+cfgmgr -l vscsi0
+lsdev -Cc cdrom
+mkdir -p /mnt/toolbox
+mount -v udfs -o ro /dev/cd0 /mnt/toolbox
+ls /mnt/toolbox
+ls /mnt/toolbox/ezinstall/ppc/dnf_aixtoolbox_local.sh</code></pre>
+
+<p>The tested Toolbox image uses UDF, not cdrfs. Check your media format if another image differs. The guest mount is not made automatic: remount it after reboot when using the ISO repositories. To eject or replace it, first run <code>umount /mnt/toolbox</code> inside AIX.</p>
+
+<h2>11. Install DNF and the yum command from the ISO</h2>
+
+<p>IBM recommends DNF for AIX Toolbox package management. The tested local media installer also supplies the yum 4 compatibility command. Small initial AIX filesystems need more room: the installer requires over 512 MiB free in both /opt and /tmp, and package caching uses /var. Check rootvg free space before growing filesystems; the following target sizes are for a fresh installation with smaller filesystems. Never reduce an already larger one.</p>
+
+<pre><code># Inside AIX as root:
+lsvg rootvg
+df -m /opt /tmp /var
+# Grow only when the existing filesystem is smaller than the target:
+chfs -a size=4G /opt
+chfs -a size=1G /tmp
+chfs -a size=1G /var
+/mnt/toolbox/ezinstall/ppc/dnf_aixtoolbox_local.sh /mnt/toolbox
+rpm --import /opt/freeware/etc/dnf/RPM-GPG-KEY-IBM-AIX-Toolbox
+/opt/freeware/bin/yum --version
+/opt/freeware/bin/dnf repolist
+/opt/freeware/bin/yum check</code></pre>
+
+<p>The optional project helper performs the same fresh-install setup and only grows filesystems when needed. Run it through the established SSH connection: <code>./contrib/aix73/ssh-aix.sh &#x27;ksh -s -- /mnt/toolbox&#x27; &lt; contrib/aix73/install-toolbox.sh</code>. Set <code>RESIZE_FILESYSTEMS=0</code> inside the guest invocation to manage sizes yourself. If DNF already exists, the helper leaves its repository configuration intact.</p>
+
+<p>The reference ISO installed yum/DNF 4.2.17 and configured local generic, noarch and AIX 7.3 repositories with package-signature checking enabled. Keep the ISO mounted to install from those repositories. Select packages instead of trying to install the entire collection at once.</p>
+
+<pre><code>/opt/freeware/bin/yum list available bash
+# Example optional developer packages:
+/opt/freeware/bin/yum install bash gcc gcc-c++ make git</code></pre>
+
+<p>For new root login shells, append the Toolbox directory after native AIX utilities in <code>/.profile</code>. The project Toolbox helper does this automatically. For non-login SSH commands, using the absolute executable path is reliable. Do not set a global LIBPATH merely to make Toolbox applications run.</p>
+
+<pre><code>case &quot;:$PATH:&quot; in
+    *:/opt/freeware/bin:*) ;;
+    *) PATH=&quot;$PATH:/opt/freeware/bin&quot;; export PATH ;;
+esac</code></pre>
+
+<h2>12. Boot, reboot and shut down from the shell</h2>
+
+<p>Package installation needs root. If yum or dnf reports permission denied for /var/cache/dnf/expired_repos.json, run <code>id</code> and use <code>su -</code> to enter a root login shell before installing packages. Keep the package cache protected. For example, root can run <code>/opt/freeware/bin/dnf install rust.ppc cargo.ppc</code>. AIX includes <code>topas</code> for live system monitoring; a command named <code>top</code> is not installed by default.</p>
+
+<pre><code># Host: cold boot an existing installed disk
+export DISK=&quot;/absolute/path/to/your/aix.qcow2&quot;
+export RUN_DIR=&quot;$PWD/run-aix73&quot;
+DAEMONIZE=1 CONSOLE=sock ./contrib/aix73/run-aix.sh
+
+# Host: inspect state and log in
+python3 contrib/aix73/vmctl.py qmp query-status
+./contrib/aix73/ssh-aix.sh
+
+# Host: ask AIX for a clean reboot
+./contrib/aix73/ssh-aix.sh &#x27;shutdown -Fr&#x27;
+
+# Host: clean shutdown; wait for Halt completed
+./contrib/aix73/ssh-aix.sh &#x27;shutdown -Fh&#x27;
+tail -f &quot;$RUN_DIR/console.log&quot;</code></pre>
+
+<p>Do not start a second writer against the same disk. Prefer guest shutdown over killing QEMU. Monitor <code>quit</code> is a recovery/finished-install tool, not a substitute for flushing a running operating system. Before an experiment, shut down and make a backup or an offline qcow2 snapshot on your own storage.</p>
+
+<pre><code># Only while the VM is stopped:
+dist/bin/qemu-img snapshot -c before-experiment &quot;$DISK&quot;
+dist/bin/qemu-img check &quot;$DISK&quot;</code></pre>
+
+<p>On macOS, daemon mode launches a detached <code>caffeinate -im -w PID</code> helper. It inhibits host and disk idle sleep only while that QEMU process exists. The state directory also stores the console, monitor sockets and logs.</p>
+
+<p>Keep external storage connected while the VM is running. Disconnecting a drive containing the disk image can leave QEMU with failed I/O even after reattachment. If guest shutdown is no longer possible, stop QEMU with <code>python3 contrib/aix73/vmctl.py qmp quit</code>, check the image offline, and start it again. Monitor quit is a forced stop and can lose pending writes; do not run image checks or repair tools while QEMU still has the disk open.</p>
+
+<h2>13. What was fixed</h2>
+
+<ul><li>Boot-platform identification: the AIX loader rejects stock qemu,pseries. The diagnostic profile exposes its recognized qemu,pseriesNOPE string; the final profile uses native PAPR identification with IBM,pSeries.</li><li>Real-mode addressing: AIX relies on a 1 TiB VRMA segment wrap. The opt-in CPU handling masks the real-mode address to its 40-bit segment offset.</li><li>Interrupt setup: XICS avoids the observed XIVE initialization failure. Native AIX also requires a reg property on the XICS device-tree node.</li><li>Stable disk identity: standard SCSI INQUIRY vendor bytes and a T10 VPD 0x83 identifier let AIX restore its MPIO path and find its boot disk. The x-aix-vscsi-id property is opt-in; keep the chosen DISK_ID stable for that disk and use distinct IDs for different disks.</li><li>Native discovery: AIX ignores an all-zero REPORT LUNS entry. The native-PAPR profile reports logical-unit addressing for target zero, matching SLOF.</li><li>Data integrity: vSCSI&#x27;s descriptor cursor was uint16_t. A 128 KiB DMA callback wrapped it to zero, so a 256 KiB request overwrote or repeated its first half. Widening it to uint32_t fixed the corrupted metadata read behind LED 0552. This is a generic SCSI correctness fix, not an AIX-only workaround.</li><li>ASO discovery: the CPU device tree now describes the emulated DSCR controls through ibm,pa-optimizations. Native PAPR also supplies H_GET_PPP processor-capacity information and uses the correct capacity units.</li><li>Enhanced affinity: AIX requires the CPU leaf in ibm,max-associativity-domains. The native multi-node profile includes five levels and the full interrupt-server-number range; otherwise early boot asserts on a five-versus-four mismatch.</li><li>Firmware loading: the local SLOF recipe increases the PREP load limit so the complete AIX boot image is read.</li><li>Diagnostics: optional hypercall, DMA-header and disk-error trace events help identify failures without modifying guest binaries.</li></ul>
+
+<p>Most compatibility behavior is opt-in through <code>aix-compat</code>, <code>aix-papr</code> and <code>x-aix-vscsi-id</code>. Default upstream-style behavior is preserved where appropriate; the descriptor-width fix corrects the general vSCSI path. The final installation used the original AIX boot script, kernel, applications and fsck tools.</p>
+
+<h2>14. Verify the build and the guest</h2>
+
+<p>These regression tests need no AIX media or licensed guest binaries. They launch a tiny kernel-free POWER guest, issue real hypercalls and CRQs, and verify data through the actual vSCSI DMA path. The NUMA test also checks the device tree with sparse interrupt-server IDs.</p>
+
+<pre><code>python3 contrib/aix73/test-vscsi-large-io.py
+python3 contrib/aix73/test-vscsi-large-io.py --aix-papr
+python3 contrib/aix73/test-vscsi-large-io.py --numa
+python3 contrib/aix73/test-vscsi-large-io.py --aix-papr --numa
+python3 contrib/aix73/test-vscsi-large-io.py \
+  --qemu &quot;$PWD/dist-debug/bin/qemu-system-ppc64&quot; --aix-papr --numa
+
+ninja -C build tests/qtest/qos-test
+QTEST_QEMU_BINARY=&quot;$PWD/dist/bin/qemu-system-ppc64&quot; \
+  build/tests/qtest/qos-test \
+  -p /ppc64/pseries/spapr-pci-host-bridge/pci-bus-spapr/pci-bus/virtio-scsi-pci/virtio-scsi/virtio-scsi-tests</code></pre>
+
+<p>The reference setup passed the default/native and NUMA variants, the debug-build native NUMA case, seven virtio-scsi qtests, clean AIX reboot, SSH/network/DNS checks and multi-hour operation with ASO active. The original private runtime logs are deliberately not distributed.</p>
+
+<p>Inside AIX, a small integrity check can use a different pattern in each 128 KiB chunk. A repeating identical chunk would hide the original DMA bug.</p>
+
+<pre><code>perl -e &#x27;for $i (0..31) { print pack(&quot;N&quot;, $i) x 32768; }&#x27; \
+  &gt; /var/tmp/aix73-io-test.bin
+cp /var/tmp/aix73-io-test.bin /tmp/aix73-io-test-copy.bin
+sync
+cmp /var/tmp/aix73-io-test.bin /tmp/aix73-io-test-copy.bin
+cksum /var/tmp/aix73-io-test.bin
+# Expected: 1119666347 4194304
+# Check the same file again after a clean reboot.</code></pre>
+
+<h2>15. Troubleshooting and limits</h2>
+
+<ul><li>An unsupported-configuration message at CD boot usually means the patched machine options or the intended QEMU executable are not being used. Check the installed dist executable, not only the build directory.</li><li>LED 0554 with no usable disk path calls for checking inquiry identification, REPORT LUNS and the actual boot device. Do not force hdisk0 into rc.boot.</li><li>LED 0552 with ondisk_vgda_size is 0 can indicate the old descriptor-offset bug. Run the distinct-data regression instead of assuming the guest disk is corrupt.</li><li>A kernel stop during interrupt setup can mean XIVE was selected or the XICS reg property is absent. The validated profile uses XICS.</li><li>ASO&#x27;s KVM rejection requires the native-PAPR profile. DSCR ENOTSUP/assertion failures call for checking CPU optimization metadata. Enhanced-affinity rejection calls for checking the NUMA configuration and associativity-domain patch.</li><li>Large-page promotion may hibernate with 4 GiB RAM, and idle workloads may not be eligible for tuning. Some optional hypercalls and hardware-diagnostics utilities remain unsupported. Do not equate service startup with full PowerVM or physical-cache emulation.</li><li>During verbose debugging, keep the console reader draining output. Only one socket client can be attached at a time.</li><li>If storage I/O fails, capture QMP block counters and scsi_disk_rw_error events, stop the guest safely, and inspect the image offline. One earlier long-idle run had a transient I/O incident whose exact cause was not proven; later checks after reopening and applying the fixes passed. Keep host/disk sleep inhibition and backups rather than claiming exhaustive reliability.</li></ul>
+
+<pre><code>python3 contrib/aix73/vmctl.py hmp &#x27;info registers&#x27;
+python3 contrib/aix73/vmctl.py qmp query-blockstats
+python3 contrib/aix73/vmctl.py hmp &quot;dumpdtb $RUN_DIR/guest.dtb&quot;
+dtc -I dtb -O dts &quot;$RUN_DIR/guest.dtb&quot;
+# To capture every hypercall temporarily (very verbose):
+python3 contrib/aix73/vmctl.py hmp &#x27;trace-event spapr_hcall on&#x27;
+python3 contrib/aix73/vmctl.py hmp &#x27;trace-event spapr_hcall off&#x27;</code></pre>
+
+<p>Guest GDB uses big-endian <code>powerpc:common64</code> on localhost:1234. <code>GDB_WAIT=1</code> stops CPUs at startup. <code>aix.gdb</code> and the CI, SLB, vector, MSR and NUMA tracing scripts are included as source. Their absolute guest addresses depend on the AIX build and must be verified before use on another release. HMP dump filenames should be absolute because QEMU daemonizes. Logs, device trees and memory dumps can contain sensitive or licensed data; keep them outside publication commits.</p>
+
+<h2>Sources and publication notes</h2>
+
+<ul><li>QEMU build documentation: <a href="https://www.qemu.org/docs/master/about/build-platforms.html">https://www.qemu.org/docs/master/about/build-platforms.html</a></li><li>SLOF build procedure: the pinned roms/SLOF/README and the public SLOF project at <a href="https://gitlab.com/qemu-project/SLOF">https://gitlab.com/qemu-project/SLOF</a></li><li>IBM Toolbox getting started: <a href="https://www.ibm.com/support/pages/aix-toolbox-open-source-software-get-started">https://www.ibm.com/support/pages/aix-toolbox-open-source-software-get-started</a></li><li>IBM local DNF media procedure: <a href="https://community.ibm.com/community/user/blogs/sangamesh-mallayya1/2022/02/09/creating-local-repo-with-dnf-and-aix-toolbox-media">https://community.ibm.com/community/user/blogs/sangamesh-mallayya1/2022/02/09/creating-local-repo-with-dnf-and-aix-toolbox-media</a></li></ul>
+
+<p>All credentials and path choices in this guide must be supplied by the reader. Do not publish a configured state directory, media image, guest disk, SSH key, root password, extracted kernel or diagnostic dump. Review the staged paths and binary-file report before publishing source changes. The README preserves upstream QEMU information below; the article draft in wordpress.txt is HTML suitable for WordPress code view or a Custom HTML block. Publish the source branch and verify its URL before publishing the article.</p>
+
+</article>
+
+<!-- /wp:html -->

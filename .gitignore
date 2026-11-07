@@ -20,3 +20,27 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+
+# Local AIX development state, credentials, media and generated artifacts.
+/build-debug/
+/build-aix-*/
+/dist/
+/dist-debug/
+/run-aix73/
+/run-aix73-*/
+/private/
+/.private/
+/slof-aix.bin
+/contrib/aix73/run/
+/contrib/aix73/run-*/
+/contrib/aix73/*.bin
+*.qcow2
+*.qcow
+*.iso
+*.vmdk
+*.vdi
+**/aix_ed25519*
+**/aix-root-password*
+**/ssh_known_hosts
+# These are text patches, not generated images.
+!/contrib/aix73/*.patch

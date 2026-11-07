@@ -303,7 +303,8 @@ static void rtas_ibm_get_system_parameter(PowerPCCPU *cpu,
                                                      "DesMem=%" PRIu64 ","
                                                      "DesProcs=%d,"
                                                      "MaxPlatProcs=%d",
-                                                     ms->smp.max_cpus,
+                                                     ms->smp.max_cpus *
+                                                     (spapr->aix_compat ? 100 : 1),
                                                      ms->ram_size / MiB,
                                                      ms->smp.cpus,
                                                      ms->smp.max_cpus);

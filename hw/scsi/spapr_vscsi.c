@@ -86,7 +86,8 @@ typedef struct vscsi_req {
     uint16_t                total_desc;
     uint16_t                cdb_offset;
     uint16_t                cur_desc_num;
-    uint16_t                cur_desc_offset;
+    /* A direct descriptor can span multiple 128 KiB SCSI DMA chunks. */
+    uint32_t                cur_desc_offset;
 } vscsi_req;
 
 #define TYPE_VIO_SPAPR_VSCSI_DEVICE "spapr-vscsi"
@@ -387,6 +388,9 @@ static int vscsi_srp_direct_data(VSCSIState *s, vscsi_req *req,
     if (rc) {
         return -1;
     }
+    trace_spapr_vscsi_direct_data(req->qtag, req->cur_desc_offset,
+                                  md.va, llen,
+                                  llen >= 4 ? ldl_be_p(buf) : 0);
     req->cur_desc_offset += llen;
 
     return llen;
@@ -620,7 +624,7 @@ static const VMStateDescription vmstate_spapr_vscsi_req = {
         VMSTATE_UINT16(cdb_offset, vscsi_req),
       /*Restart SCSI request from the beginning for now */
       /*VMSTATE_UINT16(cur_desc_num, vscsi_req),
-        VMSTATE_UINT16(cur_desc_offset, vscsi_req),*/
+        VMSTATE_UINT32(cur_desc_offset, vscsi_req),*/
         VMSTATE_END_OF_LIST()
     },
 };
@@ -764,9 +768,11 @@ static void vscsi_report_luns(VSCSIState *s, vscsi_req *req)
         DeviceState *qdev = kid->child;
         SCSIDevice *dev = SCSI_DEVICE(qdev);
 
-        if (dev->id == 0 && dev->channel == 0) {
+        if (dev->id == 0 && dev->channel == 0 &&
+            !SPAPR_MACHINE(qdev_get_machine())->aix_papr) {
             resp_data[i] = 0;         /* Use simple LUN for 0 (SAM5 4.7.7.1) */
         } else {
+            /* AIX's native vSCSI discovery treats an all-zero LUN as empty. */
             resp_data[i] = (2 << 6);  /* Otherwise LUN addressing (4.7.7.4)  */
         }
         resp_data[i] |= dev->id;

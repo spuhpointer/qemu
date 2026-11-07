@@ -1565,8 +1565,9 @@ void spapr_unregister_hypercall(target_ulong opcode)
     *slot = NULL;
 }
 
-target_ulong spapr_hypercall(PowerPCCPU *cpu, target_ulong opcode,
-                             target_ulong *args)
+static target_ulong spapr_hypercall_dispatch(PowerPCCPU *cpu,
+                                             target_ulong opcode,
+                                             target_ulong *args)
 {
     SpaprMachineState *spapr = SPAPR_MACHINE(qdev_get_machine());
 
@@ -1598,6 +1599,16 @@ target_ulong spapr_hypercall(PowerPCCPU *cpu, target_ulong opcode,
     return H_FUNCTION;
 }
 
+target_ulong spapr_hypercall(PowerPCCPU *cpu, target_ulong opcode,
+                             target_ulong *args)
+{
+    uint64_t a0 = args[0], a1 = args[1], a2 = args[2], a3 = args[3];
+    target_ulong ret = spapr_hypercall_dispatch(cpu, opcode, args);
+
+    trace_spapr_hcall(opcode, a0, a1, a2, a3, ret, args[0], args[1]);
+    return ret;
+}
+
 #ifdef CONFIG_TCG
 static void hypercall_register_softmmu(void)
 {
@@ -1623,6 +1634,26 @@ static void hypercall_register_softmmu(void)
 }
 #endif
 
+static target_ulong h_get_ppp(PowerPCCPU *cpu, SpaprMachineState *spapr,
+                             target_ulong opcode, target_ulong *args)
+{
+    MachineState *ms = MACHINE(spapr);
+    uint64_t cores = DIV_ROUND_UP(ms->smp.cpus, ms->smp.threads);
+    uint64_t capacity = cores * 100;
+
+    if (!spapr->aix_papr) {
+        return H_FUNCTION;
+    }
+
+    /* A single capped partition owns the emulated processor pool. */
+    args[0] = capacity;
+    args[1] = 0;
+    args[2] = cores << 32;
+    args[3] = (1ULL << 48) | (128ULL << 40) | (cores << 16) | cores;
+    args[4] = (cores << 48) | (capacity << 24) | capacity;
+    return H_SUCCESS;
+}
+
 static void hypercall_register_types(void)
 {
     hypercall_register_softmmu();
@@ -1636,6 +1667,7 @@ static void hypercall_register_types(void)
     spapr_register_hypercall(H_CEDE, h_cede);
     spapr_register_hypercall(H_CONFER, h_confer);
     spapr_register_hypercall(H_PROD, h_prod);
+    spapr_register_hypercall(H_GET_PPP, h_get_ppp);
 
     /* hcall-join */
     spapr_register_hypercall(H_JOIN, h_join);

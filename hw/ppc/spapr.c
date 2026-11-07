@@ -790,6 +790,14 @@ static void spapr_dt_cpu(CPUState *cs, void *fdt, int offset,
 
     spapr_dt_pa_features(spapr, cpu, fdt, offset);
 
+    if (spapr->aix_papr && ppc_has_spr(cpu, SPR_DSCR)) {
+        /* Make the emulated DSCR controls discoverable to the AIX kernel. */
+        static const uint8_t pa_optimizations[] = { 2, 0, 0x10, 0 };
+
+        _FDT(fdt_setprop(fdt, offset, "ibm,pa-optimizations",
+                         pa_optimizations, sizeof(pa_optimizations)));
+    }
+
     spapr_dt_pi_features(spapr, cpu, fdt, offset);
 
     _FDT((fdt_setprop_cell(fdt, offset, "ibm,chip-id",
@@ -1068,6 +1076,10 @@ static void spapr_dt_rtas(SpaprMachineState *spapr, void *fdt)
                           RTAS_ERROR_LOG_MAX));
     _FDT(fdt_setprop_cell(fdt, rtas, "rtas-event-scan-rate",
                           RTAS_EVENT_SCAN_RATE));
+    if (spapr->aix_papr) {
+        _FDT(fdt_setprop_cell(fdt, rtas,
+                             "ibm,partition-performance-parameters-level", 1));
+    }
 
     g_assert(msi_nonbroken);
     _FDT(fdt_setprop(fdt, rtas, "ibm,change-msix-capable", NULL, 0));
@@ -1271,7 +1283,18 @@ void *spapr_build_fdt(SpaprMachineState *spapr, bool reset, size_t space)
     /* Root node */
     _FDT(fdt_setprop_string(fdt, 0, "device_type", "chrp"));
     _FDT(fdt_setprop_string(fdt, 0, "model", "IBM pSeries (emulated by qemu)"));
-    _FDT(fdt_setprop_string(fdt, 0, "compatible", "qemu,pseries"));
+    /*
+     * AIX 7.3 boot loaders refuse "qemu,pseries" and enable their QEMU
+     * support only for "qemu,pseriesNOPE".
+     */
+    _FDT(fdt_setprop_string(fdt, 0, "compatible",
+                            spapr->aix_papr ? "IBM,pSeries" :
+                            spapr->aix_compat ? "qemu,pseriesNOPE"
+                                              : "qemu,pseries"));
+
+    if (spapr->aix_papr) {
+        _FDT(fdt_setprop_cell(fdt, 0, "ibm,partition-no", 0));
+    }
 
     /* Guest UUID & Name*/
     buf = qemu_uuid_unparse_strdup(&qemu_uuid);
@@ -1300,6 +1323,15 @@ void *spapr_build_fdt(SpaprMachineState *spapr, bool reset, size_t space)
 
     /* /interrupt controller */
     spapr_irq_dt(spapr, spapr_max_server_number(spapr), fdt, PHANDLE_INTC);
+    if (spapr->aix_papr) {
+        int intc = fdt_path_offset(fdt, "/interrupt-controller");
+        uint64_t reg[2] = { 0, 0 };
+
+        /* XICS uses hypercalls, but AIX also requires the reg property. */
+        if (intc >= 0) {
+            _FDT(fdt_setprop(fdt, intc, "reg", reg, sizeof(reg)));
+        }
+    }
 
     ret = spapr_dt_memory(spapr, fdt);
     if (ret < 0) {
@@ -3351,6 +3383,30 @@ static void spapr_set_resize_hpt(Object *obj, const char *value, Error **errp)
     }
 }
 
+static bool spapr_get_aix_compat(Object *obj, Error **errp)
+{
+    SpaprMachineState *spapr = SPAPR_MACHINE(obj);
+
+    return spapr->aix_compat;
+}
+
+static bool spapr_get_aix_papr(Object *obj, Error **errp)
+{
+    return SPAPR_MACHINE(obj)->aix_papr;
+}
+
+static void spapr_set_aix_papr(Object *obj, bool value, Error **errp)
+{
+    SPAPR_MACHINE(obj)->aix_papr = value;
+}
+
+static void spapr_set_aix_compat(Object *obj, bool value, Error **errp)
+{
+    SpaprMachineState *spapr = SPAPR_MACHINE(obj);
+
+    spapr->aix_compat = value;
+}
+
 static bool spapr_get_vof(Object *obj, Error **errp)
 {
     SpaprMachineState *spapr = SPAPR_MACHINE(obj);
@@ -3495,6 +3551,16 @@ static void spapr_instance_init(Object *obj)
     object_property_add_bool(obj, "x-vof", spapr_get_vof, spapr_set_vof);
     object_property_set_description(obj, "x-vof",
                                     "Enable Virtual Open Firmware (experimental)");
+
+    object_property_add_bool(obj, "aix-compat", spapr_get_aix_compat,
+                             spapr_set_aix_compat);
+    object_property_set_description(obj, "aix-compat",
+                                    "Advertise the root compatible value that "
+                                    "AIX 7.3 accepts");
+    object_property_add_bool(obj, "aix-papr", spapr_get_aix_papr,
+                             spapr_set_aix_papr);
+    object_property_set_description(obj, "aix-papr",
+                                    "Experimental native PAPR identity for AIX");
 
     /* The machine class defines the default interrupt controller mode */
     spapr->irq = smc->irq;

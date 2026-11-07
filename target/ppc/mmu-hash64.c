@@ -1014,9 +1014,13 @@ bool ppc_hash64_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
 
         if (cpu->vhyp) {
             /*
-             * In virtual hypervisor mode, there's nothing to do:
-             *   EA == GPA == qemu guest address
+             * In virtual hypervisor mode, EA == GPA == qemu guest address.
+             * A PowerVM VRMA translates real mode through one 1TiB segment,
+             * so only the segment offset selects the address.
              */
+            if (cpu->vhyp_vrma_wrap) {
+                raddr &= (1ULL << 40) - 1;
+            }
         } else if (mmuidx_hv(mmu_idx) || !env->has_hv_mode) {
             /* In HV mode, add HRMOR if top EA bit is clear */
             if (!(eaddr >> 63)) {

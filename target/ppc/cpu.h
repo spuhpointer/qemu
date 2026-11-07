@@ -1526,6 +1526,8 @@ struct ArchCPU {
     uint32_t compat_pvr;
     PPCVirtualHypervisor *vhyp;
     PPCVirtualHypervisorClass *vhyp_class;
+    /* Under vhyp, real mode wraps at 1TiB like a PowerVM VRMA segment */
+    bool vhyp_vrma_wrap;
     void *machine_data;
     int32_t node_id; /* NUMA node this CPU belongs to */
     PPCHash64Options *hash64_opts;

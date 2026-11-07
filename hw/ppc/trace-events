@@ -10,6 +10,7 @@ spapr_pci_lsi_set(const char *busname, int pin, uint32_t irq) "%s PIN%d IRQ %u"
 spapr_pci_msi_retry(unsigned config_addr, unsigned req_num, unsigned max_irqs) "Guest device at 0x%x asked %u, have only %u"
 
 # spapr_hcall.c
+spapr_hcall(uint64_t opcode, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t ret, uint64_t r4, uint64_t r5) "op=0x%"PRIx64" args=0x%"PRIx64" 0x%"PRIx64" 0x%"PRIx64" 0x%"PRIx64" ret=%"PRId64" out=0x%"PRIx64" 0x%"PRIx64
 spapr_cas_continue(unsigned long n) "Copy changes to the guest: %ld bytes"
 spapr_cas_pvr(uint32_t cur_pvr, bool explicit_match, uint32_t new_pvr) "current=0x%x, explicit_match=%u, new=0x%x"
 spapr_h_resize_hpt_prepare(uint64_t flags, uint64_t shift) "flags=0x%"PRIx64", shift=%"PRIu64

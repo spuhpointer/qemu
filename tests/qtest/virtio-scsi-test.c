@@ -61,7 +61,7 @@ static uint64_t qvirtio_scsi_alloc(QVirtioSCSIQueues *vs, size_t alloc_size,
 
 static uint8_t virtio_scsi_do_command(QVirtioSCSIQueues *vs,
                                       const uint8_t *cdb,
-                                      const uint8_t *data_in,
+                                      uint8_t *data_in,
                                       size_t data_in_len,
                                       uint8_t *data_out, size_t data_out_len,
                                       struct virtio_scsi_cmd_resp *resp_out)
@@ -109,6 +109,9 @@ static uint8_t virtio_scsi_do_command(QVirtioSCSIQueues *vs,
 
     if (resp_out) {
         memread(resp_addr, resp_out, sizeof(*resp_out));
+    }
+    if (data_in && data_in_len) {
+        memread(data_in_addr, data_in, data_in_len);
     }
 
     guest_free(alloc, req_addr);
@@ -162,6 +165,59 @@ static void hotplug(void *obj, void *data, QGuestAllocator *t_alloc)
 
     qtest_qmp_device_add(qts, "scsi-hd", "scsihd", "{'drive': 'drv1'}");
     qtest_qmp_device_del(qts, "scsihd");
+}
+
+static void test_aix_vscsi_inquiry(void *obj, void *data,
+                                  QGuestAllocator *t_alloc)
+{
+    QVirtioSCSI *scsi = obj;
+    QVirtioSCSIQueues *vs;
+    const char *id = data;
+    uint8_t cdb[VIRTIO_SCSI_CDB_SIZE] = { INQUIRY };
+    uint8_t buf[255];
+    struct virtio_scsi_cmd_resp resp;
+    const unsigned lengths[] = { 4, 36, 96, 255 };
+
+    alloc = t_alloc;
+    vs = qvirtio_scsi_init(scsi->vdev);
+    for (size_t i = 0; i < G_N_ELEMENTS(lengths); i++) {
+        memset(buf, 0xa5, sizeof(buf));
+        cdb[4] = lengths[i];
+        g_assert_cmpint(virtio_scsi_do_command(vs, cdb, buf, lengths[i],
+                                             NULL, 0, &resp), ==, 0);
+        g_assert_cmpint(resp.status, ==, GOOD);
+        if (id && lengths[i] >= 5) {
+            g_assert_cmpint(buf[4], ==, 250);
+        }
+        if (lengths[i] == sizeof(buf)) {
+            if (id) {
+                g_assert_cmpmem(buf + 96, strlen(id), id, strlen(id));
+                for (size_t j = 96 + strlen(id); j < sizeof(buf); j++) {
+                    g_assert_cmpint(buf[j], ==, ' ');
+                }
+            } else {
+                g_assert_cmpint(buf[96], ==, 0);
+            }
+        }
+    }
+
+    cdb[1] = 1;
+    cdb[2] = 0x83;
+    cdb[4] = sizeof(buf);
+    g_assert_cmpint(virtio_scsi_do_command(vs, cdb, buf, sizeof(buf),
+                                         NULL, 0, &resp), ==, 0);
+    g_assert_cmpint(resp.status, ==, GOOD);
+    g_assert_cmpint(buf[1], ==, 0x83);
+    g_assert_cmpint(buf[4], ==, 2); /* ASCII */
+    g_assert_cmpint(buf[5], ==, id ? 1 : 0);
+    if (id) {
+        g_assert_cmpint(buf[3], ==, 12 + strlen(id));
+        g_assert_cmpint(buf[7], ==, 8 + strlen(id));
+        g_assert_cmpmem(buf + 8, 8, "QEMU    ", 8);
+        g_assert_cmpmem(buf + 16, strlen(id), id, strlen(id));
+    }
+    qvirtio_scsi_pci_free(vs);
+    g_free(data);
 }
 
 /* Test WRITE SAME with the lba not aligned */
@@ -365,6 +421,18 @@ static void *virtio_scsi_setup_4k(GString *cmd_line, void *arg)
     return arg;
 }
 
+static void *virtio_scsi_setup_aix(GString *cmd_line, void *arg)
+{
+    unsigned len = GPOINTER_TO_UINT(arg);
+    char *id = len ? g_strnfill(len, 'A') : NULL;
+
+    virtio_scsi_setup(cmd_line, NULL);
+    if (id) {
+        g_string_append_printf(cmd_line, ",x-aix-vscsi-id=%s", id);
+    }
+    return id;
+}
+
 static void *virtio_scsi_setup_cd(GString *cmd_line, void *arg)
 {
     g_string_append(cmd_line,
@@ -394,6 +462,17 @@ static void register_virtio_scsi_test(void)
     opts.before = virtio_scsi_setup;
     qos_add_test("unaligned-write-same", "virtio-scsi",
                  test_unaligned_write_same, &opts);
+
+    opts.before = virtio_scsi_setup_aix;
+    qos_add_test("inquiry-default", "virtio-scsi",
+                 test_aix_vscsi_inquiry, &opts);
+    opts.arg = GUINT_TO_POINTER(17);
+    qos_add_test("inquiry-aix-vscsi", "virtio-scsi",
+                 test_aix_vscsi_inquiry, &opts);
+    opts.arg = GUINT_TO_POINTER(159);
+    qos_add_test("inquiry-aix-vscsi-max", "virtio-scsi",
+                 test_aix_vscsi_inquiry, &opts);
+    opts.arg = NULL;
 
     opts.before = virtio_scsi_setup_4k;
     qos_add_test("large-lba-unmap", "virtio-scsi",

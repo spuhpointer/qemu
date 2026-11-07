@@ -481,8 +481,19 @@ static void spapr_numa_FORM1_write_rtas_dt(SpaprMachineState *spapr,
     _FDT(fdt_setprop(fdt, rtas, "ibm,associativity-reference-points",
                      refpoints, nr_refpoints * sizeof(refpoints[0])));
 
-    _FDT(fdt_setprop(fdt, rtas, "ibm,max-associativity-domains",
-                     maxdomains, sizeof(maxdomains)));
+    if (spapr->aix_papr && ms->numa_state->num_nodes > 1) {
+        uint32_t aix_maxdomains[6];
+
+        /* AIX validates the CPU leaf level as well as the NUMA domains. */
+        memcpy(aix_maxdomains, maxdomains, sizeof(maxdomains));
+        aix_maxdomains[0] = cpu_to_be32(5);
+        aix_maxdomains[5] = cpu_to_be32(spapr_max_server_number(spapr));
+        _FDT(fdt_setprop(fdt, rtas, "ibm,max-associativity-domains",
+                         aix_maxdomains, sizeof(aix_maxdomains)));
+    } else {
+        _FDT(fdt_setprop(fdt, rtas, "ibm,max-associativity-domains",
+                         maxdomains, sizeof(maxdomains)));
+    }
 }
 
 static void spapr_numa_FORM2_write_rtas_tables(SpaprMachineState *spapr,
